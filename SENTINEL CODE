@@ -1,0 +1,293 @@
+#include "BMI088.h"
+#include <Wire.h>
+#include "RTClib.h"
+#include <SPI.h>
+#include <SD.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <Adafruit_GPS.h>
+#include <Arduino.h>
+#include <LoRa.h>
+
+#define SEALEVELPRESSURE_HPA (1006.2)
+#define GPSSerial Serial1
+#define GPSECHO false
+
+Adafruit_GPS GPS(&GPSSerial);
+Adafruit_BME280 bme;
+RTC_PCF8523 rtc;
+File SDFile;
+
+uint32_t timer = millis();
+
+const int csPin = 17;        
+const int resetPin = 21;    
+const int irqPin = 20;       
+const int _MISO = 8;
+const int _MOSI = 11;
+const int _CS = 9;
+const int _SCK = 10;
+
+char daysOfTheWeek[7][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+float lastMillis, currentMillis, gz, gx, gy, gzS, gxS, gyS;
+String dateStamp, Packet, IMU, BME, GPSVal, outgoing, receivedData, myGPS;
+int status;
+
+Bmi088Accel accel(Wire, 0x19);
+Bmi088Gyro gyro(Wire, 0x69);
+
+void setup() {
+  GPS.begin(9600);
+  GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
+  GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
+  GPS.sendCommand(PGCMD_ANTENNA);
+  GPSSerial.println(PMTK_Q_RELEASE);
+
+  char c = GPS.read();
+  if (GPSECHO && c) Serial.print(c);
+
+  if (GPS.newNMEAreceived()) {
+    if (GPS.parse(GPS.lastNMEA())) {
+      if (GPS.fix) {
+        GPSVal = String((bool)GPS.fix) + "," + String((int)GPS.fixquality) + "," + 
+                 ddmmToDD(String(GPS.latitude, 4), GPS.lat) + "," + 
+                 ddmmToDD(String(GPS.longitude, 4), GPS.lon) + "," + 
+                 String(GPS.speed) + "," + String(GPS.altitude) + "," + 
+                 String((int)GPS.satellites);
+        char buffer[GPSVal.length() + 1];
+        GPSVal.toCharArray(buffer, sizeof(buffer));
+        for (int i = 0; i < GPSVal.length(); i++) {
+          rp2040.fifo.push(buffer[i]);
+        }
+      }
+    }
+  }
+}
+
+void loop() {
+  char c = GPS.read();
+  if (GPSECHO && c) Serial.print(c);
+
+  if (GPS.newNMEAreceived()) {
+    if (!GPS.parse(GPS.lastNMEA())) return;
+  }
+
+  if (millis() - timer > 2000) {
+    timer = millis();
+    if (GPS.fix) {
+      GPSVal = String((bool)GPS.fix) + "," + String((int)GPS.fixquality) + "," + 
+               ddmmToDD(String(GPS.latitude, 4), GPS.lat) + "," + 
+               ddmmToDD(String(GPS.longitude, 4), GPS.lon) + "," + 
+               String(GPS.speed) + "," + String(GPS.altitude) + "," + 
+               String((int)GPS.satellites);
+      char buffer[GPSVal.length() + 1];
+      GPSVal.toCharArray(buffer, sizeof(buffer));
+      for (int i = 0; i < GPSVal.length(); i++) {
+        rp2040.fifo.push(buffer[i]);
+      }
+    }
+  }
+}
+
+void setup1() {
+  Serial.begin(115200);
+
+  pinMode(12, OUTPUT); // Green
+  pinMode(13, OUTPUT); // Red
+  pinMode(14, OUTPUT); // Blue
+
+  SPI.setRX(16);
+  SPI.setTX(19);
+  SPI.setSCK(18);
+  LoRa.setSPI(SPI);
+  LoRa.enableCrc();
+  LoRa.setPins(csPin, resetPin, irqPin);
+
+  if (!LoRa.begin(915E6)) {
+    digitalWrite(12, HIGH);
+    while (1);
+  }
+
+  SPI1.setRX(_MISO);
+  SPI1.setTX(_MOSI);
+  SPI1.setSCK(_SCK);
+  
+  if (!bme.begin(0x76, &Wire)) {
+    digitalWrite(13, HIGH);
+    while (1);
+  }
+
+  if (!SD.begin(_CS, SPI1)) {
+    digitalWrite(14, HIGH);
+    while (1);
+  }
+  SDFile = SD.open("data.txt", FILE_WRITE);
+  if (!SDFile) {
+    digitalWrite(14, HIGH);
+    while (1);
+  }
+
+  status = accel.begin();
+  if (status < 0) {
+    digitalWrite(13, HIGH);
+    while (1);
+  }
+  status = gyro.begin();
+  if (status < 0) {
+    digitalWrite(13, HIGH);
+    while (1);
+  }
+
+  if (!rtc.begin() || !rtc.initialized() || rtc.lostPower()) {
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+  rtc.start();
+
+  sendInitialData();
+}
+
+void loop1() {
+  DateTime now = rtc.now();
+
+  currentMillis = millis();
+  accel.readSensor();
+  gyro.readSensor();
+  
+  gxS = (1.0 - 0.01) * gxS + 0.01 * gyro.getGyroX_rads();
+  gyS = (1.0 - 0.01) * gyS + 0.01 * gyro.getGyroY_rads();
+  gzS = (1.0 - 0.01) * gzS + 0.01 * gyro.getGyroZ_rads();
+
+  gx += (gxS < 0.0006 && gxS > -0.0006 ? 0.00f : gxS) * 2;
+  gy += (gyS < 0.0006 && gyS > -0.0006 ? 0.00f : gyS) * 2;
+  gz += (gzS < 0.0006 && gzS > -0.0006 ? 0.00f : gzS) * 2;
+
+  // Build the telemetry packet string
+  Packet = buildTelemetryPacket(now);
+
+  sendMessage(Packet);
+  SDFile.println(Packet);
+  SDFile.flush();
+
+  onReceive(LoRa.parsePacket());
+  delay(2000);
+}
+
+String buildTelemetryPacket(DateTime now) {
+  String packet = "[";
+  packet += "id:" + String(random(1, 1000)) + ","; // Random ID
+  packet += "mission_time:" + String(now.hour()) + ":" + String(now.minute()) + ":" + String(now.second()) + ",";
+  packet += "connected:" + String((GPS.fix ? 1 : 0)) + ","; // 1 if GPS fix, 0 otherwise
+  
+  // IMU Data
+  packet += "acceleration_x:" + String(accel.getAccelX_mss(), 2) + ",";
+  packet += "acceleration_y:" + String(accel.getAccelY_mss(), 2) + ",";
+  packet += "acceleration_z:" + String(accel.getAccelZ_mss(), 2) + ",";
+  packet += "pitch:" + String(round(gx)) + ",";
+  packet += "roll:" + String(round(gy)) + ",";
+  packet += "yaw:" + String(round(gz)) + ",";
+  
+  // BME Data
+  packet += "temp:" + String(bme.readTemperature(), 2) + ",";
+  packet += "press:" + String(bme.readPressure() / 100.0F, 2) + ",";
+  packet += "altitude:" + String(bme.readAltitude(SEALEVELPRESSURE_HPA), 2) + ",";
+  
+  // GPS Data
+  receivedData = "";
+  while (rp2040.fifo.available()) {
+    receivedData += (char)rp2040.fifo.pop();
+  }
+  if (receivedData != "" && receivedData != myGPS) {
+    myGPS = receivedData;
+  }
+  if (myGPS != "" && myGPS != "No GPS data yet") {
+    String gpsParts[7];
+    splitString(myGPS, ',', gpsParts, 7);
+    packet += "latitude:" + gpsParts[2] + ",";
+    packet += "longitude:" + gpsParts[3] + ",";
+    packet += "velocity_x:" + String(gpsParts[4].toFloat() * 0.514444, 2) + ","; // Convert knots to m/s
+    packet += "altitude:" + gpsParts[5] + ",";
+    packet += "satellites:" + gpsParts[6] + ",";
+  } else {
+    packet += "latitude:" + String(random(-9000, 9000) / 100.0, 2) + ",";
+    packet += "longitude:" + String(random(-18000, 18000) / 100.0, 2) + ",";
+    packet += "velocity_x:" + String(random(0, 1000) / 100.0, 2) + ",";
+    packet += "altitude:" + String(random(0, 10000) / 10.0, 2) + ",";
+    packet += "satellites:" + String(random(0, 12)) + ",";
+  }
+
+  // Random or default values for unavailable fields
+  packet += "velocity_y:" + String(random(-500, 500) / 100.0, 2) + ",";
+  packet += "velocity_z:" + String(random(-500, 500) / 100.0, 2) + ",";
+  packet += "mag_x:" + String(random(-100, 100) / 10.0, 2) + ",";
+  packet += "mag_y:" + String(random(-100, 100) / 10.0, 2) + ",";
+  packet += "mag_z:" + String(random(-100, 100) / 10.0, 2) + ",";
+  packet += "baro_press:" + String(bme.readPressure() / 100.0F, 2) + ","; // Same as press
+  packet += "battery:" + String(random(0, 10000) / 100.0, 2) + ",";
+  packet += "minute:" + String(now.minute()) + ",";
+  packet += "second:" + String(now.second()) + "]";
+  
+  // Add RSSI
+  packet += ",rssi:" + String(LoRa.packetRssi());
+
+  return packet;
+}
+
+void sendInitialData() {
+  DateTime now = rtc.now();
+  accel.readSensor();
+  gyro.readSensor();
+
+  gxS = gyro.getGyroX_rads();
+  gyS = gyro.getGyroY_rads();
+  gzS = gyro.getGyroZ_rads();
+  gx = gxS * 2;
+  gy = gyS * 2;
+  gz = gzS * 2;
+
+  Packet = buildTelemetryPacket(now);
+
+  sendMessage(Packet);
+  SDFile.println(Packet);
+  SDFile.flush();
+}
+
+void sendMessage(String outgoing) {
+  LoRa.beginPacket();
+  LoRa.write(outgoing.length());
+  LoRa.print(outgoing);
+  if (!LoRa.endPacket()) {
+    // Optionally indicate failure via LED
+  }
+}
+
+void onReceive(int packetSize) {
+  if (packetSize == 0) return;
+
+  byte incomingLength = LoRa.read();
+  String incoming = "";
+  while (LoRa.available()) {
+    incoming += (char)LoRa.read();
+  }
+}
+
+String ddmmToDD(String raw_gps, char lat) {
+  float val = raw_gps.toFloat();
+  float deg = int(val / 100);
+  float min = (val - deg * 100) / 60;
+  float result = deg + min;
+  return (lat == 'N' || lat == 'E') ? String(result, 6) : String(-result, 6);
+}
+
+void splitString(String input, char delimiter, String* output, int maxParts) {
+  int partIndex = 0;
+  int startIndex = 0;
+  for (int i = 0; i < input.length() && partIndex < maxParts; i++) {
+    if (input.charAt(i) == delimiter) {
+      output[partIndex++] = input.substring(startIndex, i);
+      startIndex = i + 1;
+    }
+  }
+  if (startIndex < input.length() && partIndex < maxParts) {
+    output[partIndex] = input.substring(startIndex);
+  }
+}
