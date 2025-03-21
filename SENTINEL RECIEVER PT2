@@ -1,0 +1,150 @@
+#include <SPI.h>
+#include <LoRa.h>
+
+const int csPin = 17;        
+const int resetPin = 21;    
+const int irqPin = 20;
+
+String outgoing;
+byte msgCount = 0;
+byte localAddress = 0xBB;
+byte destination = 0xFF;
+long lastSendTime = 0;
+int interval = 2000;
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial); // Wait for serial monitor to be opened
+  
+  Serial.println("LoRa Ground Station - Telemetry Receiver");
+
+  // Set SPI0 pins
+  SPI.setRX(16);
+  SPI.setTX(19);
+  SPI.setSCK(18);
+
+  // Configure LoRa
+  LoRa.setSPI(SPI);
+  LoRa.enableCrc();
+  LoRa.setPins(csPin, resetPin, irqPin);
+
+  if (!LoRa.begin(915E6)) {
+    Serial.println("LoRa init failed. Check your connections.");
+    while (true);
+  }
+
+  Serial.println("LoRa init succeeded.");
+  Serial.println("Waiting for flight computer telemetry...");
+}
+
+void loop() {
+  onReceive(LoRa.parsePacket());
+}
+
+void sendMessage(String outgoing) {
+  LoRa.beginPacket();
+  LoRa.write(outgoing.length());
+  LoRa.print(outgoing);
+  if (!LoRa.endPacket()) {
+    Serial.println("Error: Failed to send packet");
+  }
+}
+
+void onReceive(int packetSize) {
+  if (packetSize == 0) return;
+
+  byte incomingLength = LoRa.read();
+  String incoming = "";
+
+  while (LoRa.available()) {
+    incoming += (char)LoRa.read();
+  }
+
+  // Allow 1-byte tolerance for length mismatch
+  if (abs((int)incomingLength - (int)incoming.length()) > 1) {
+    Serial.println("Error: Message length mismatch (Expected: " + String(incomingLength) + 
+                   ", Received: " + String(incoming.length()) + ")");
+    Serial.println("Raw: " + incoming);
+    return;
+  }
+
+  // Check for expected format: [key:value,...],rssi:value
+  int rssiStart = incoming.indexOf("],rssi:");
+  if (!incoming.startsWith("[") || rssiStart == -1) {
+    Serial.println("Error: Invalid packet format, missing '[' or '],rssi:'");
+    Serial.println("Raw: " + incoming);
+    return;
+  }
+
+  String telemetryData = incoming.substring(1, rssiStart); // Extract content between [ and ]
+  String rssiStr = incoming.substring(rssiStart + 7); // Extract RSSI value after ],rssi:
+
+  // Parse key-value pairs
+  String keys[] = {
+    "id", "mission_time", "connected", "acceleration_x", "acceleration_y", "acceleration_z",
+    "velocity_x", "velocity_y", "velocity_z", "pitch", "roll", "yaw",
+    "mag_x", "mag_y", "mag_z", "baro_press", "altitude", "press",
+    "latitude", "longitude", "satellites", "temp", "battery", "minute", "second"
+  };
+  String values[25]; // Array to hold values (size matches number of keys)
+  for (int i = 0; i < 25; i++) values[i] = "N/A"; // Default to N/A
+
+  int startIdx = 0;
+  for (int i = 0; i < telemetryData.length(); i++) {
+    if (telemetryData.charAt(i) == ',') {
+      String pair = telemetryData.substring(startIdx, i);
+      int colonIdx = pair.indexOf(':');
+      if (colonIdx != -1) {
+        String key = pair.substring(0, colonIdx);
+        String value = pair.substring(colonIdx + 1);
+        for (int j = 0; j < 25; j++) {
+          if (key == keys[j]) {
+            values[j] = value;
+            break;
+          }
+        }
+      }
+      startIdx = i + 1;
+    }
+  }
+  // Handle the last pair
+  if (startIdx < telemetryData.length()) {
+    String pair = telemetryData.substring(startIdx);
+    int colonIdx = pair.indexOf(':');
+    if (colonIdx != -1) {
+      String key = pair.substring(0, colonIdx);
+      String value = pair.substring(colonIdx + 1);
+      for (int j = 0; j < 25; j++) {
+        if (key == keys[j]) {
+          values[j] = value;
+          break;
+        }
+      }
+    }
+  }
+
+  // Human-readable output
+  Serial.println("Received Telemetry Packet:");
+  Serial.println("ID: " + values[0]);
+  Serial.println("Mission Time: " + values[1]);
+  Serial.println("Connected: " + values[2]);
+  Serial.println("Acceleration (X,Y,Z): " + values[3] + ", " + values[4] + ", " + values[5]);
+  Serial.println("Velocity (X,Y,Z): " + values[6] + ", " + values[7] + ", " + values[8]);
+  Serial.println("Orientation (Pitch,Roll,Yaw): " + values[9] + ", " + values[10] + ", " + values[11]);
+  Serial.println("Magnetometer (X,Y,Z): " + values[12] + ", " + values[13] + ", " + values[14]);
+  Serial.println("Barometric Pressure: " + values[15] + " hPa");
+  Serial.println("Altitude: " + values[16] + " m");
+  Serial.println("Pressure: " + values[17] + " hPa");
+  Serial.println("GPS (Lat,Lon): " + values[18] + ", " + values[19]);
+  Serial.println("Satellites: " + values[20]);
+  Serial.println("Temperature: " + values[21] + " C");
+  Serial.println("Battery: " + values[22] + " %");
+  Serial.println("Time (Min,Sec): " + values[23] + ", " + values[24]);
+  Serial.println("RSSI: " + rssiStr);
+  Serial.println("SNR: " + String(LoRa.packetSnr()));
+  Serial.println("Length Sent: " + String(incomingLength) + ", Received: " + String(incoming.length()));
+  Serial.println();
+
+  // Output in original format for Rust compatibility
+  Serial.println(incoming);
+}
