@@ -1,0 +1,90 @@
+#include <SPI.h>
+#include <LoRa.h>
+
+const int csPin = 17;        
+const int resetPin = 21;    
+const int irqPin = 20;
+
+String outgoing;
+byte msgCount = 0;
+byte localAddress = 0xBB;
+byte destination = 0xFF;
+long lastSendTime = 0;
+int interval = 2000;
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial);
+  
+  Serial.println("LoRa Ground Station - Telemetry Receiver");
+
+  SPI.setRX(16);
+  SPI.setTX(19);
+  SPI.setSCK(18);
+
+  LoRa.setSPI(SPI);
+  LoRa.enableCrc();
+  LoRa.setPins(csPin, resetPin, irqPin);
+
+  if (!LoRa.begin(915E6)) {
+    Serial.println("LoRa init failed. Check your connections.");
+    while (true);
+  }
+
+  Serial.println("LoRa init succeeded.");
+  Serial.println("Waiting for flight computer telemetry...");
+}
+
+void loop() {
+  onReceive(LoRa.parsePacket());
+}
+
+void sendMessage(String outgoing) {
+  LoRa.beginPacket();
+  LoRa.write(outgoing.length());
+  LoRa.print(outgoing);
+  if (!LoRa.endPacket()) {
+    Serial.println("Error: Failed to send packet");
+  }
+}
+
+void onReceive(int packetSize) {
+  if (packetSize == 0) return;
+
+  byte incomingLength = LoRa.read();
+  String incoming = "";
+
+  while (LoRa.available()) {
+    incoming += (char)LoRa.read();
+  }
+
+  // Allow a 1-byte tolerance for length mismatch due to LoRa quirks
+  if (abs(incomingLength - incoming.length()) > 1) {
+    Serial.println("Error: Message length mismatch (Expected: " + String(incomingLength) + 
+                   ", Received: " + String(incoming.length()) + ")");
+    Serial.println("Raw: " + incoming);
+    return;
+  }
+
+  int rssiStart = incoming.indexOf("],rssi:");
+  int bracketEnd = incoming.indexOf(']');
+  if (bracketEnd == -1) {
+    Serial.println("Error: Invalid packet format, missing ']'");
+    Serial.println("Raw: " + incoming);
+    return;
+  }
+
+  String telemetryData = incoming.substring(0, bracketEnd + 1);
+  String rssiStr = (rssiStart != -1) ? incoming.substring(rssiStart + 7) : String(LoRa.packetRssi());
+  int rssi = rssiStr.toInt();
+
+  Serial.println("Received Telemetry Packet:");
+  Serial.println("Data: " + telemetryData);
+  Serial.println("RSSI: " + String(rssi));
+  Serial.println("SNR: " + String(LoRa.packetSnr()));
+  Serial.println("Length Sent: " + String(incomingLength) + ", Received: " + String(incoming.length()));
+  Serial.println();
+
+  String rustFormatted = telemetryData + ",rssi:" + String(rssi);
+  Serial.println(rustFormatted);
+}
