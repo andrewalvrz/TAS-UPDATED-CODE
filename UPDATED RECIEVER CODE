@@ -1,0 +1,129 @@
+#include <SPI.h>
+#include <LoRa.h>
+
+const int csPin = 17;        
+const int resetPin = 21;    
+const int irqPin = 20;
+
+String outgoing;              // Outgoing message
+byte msgCount = 0;            // Count of outgoing messages
+byte localAddress = 0xBB;     // Address of this device
+byte destination = 0xFF;      // Destination to send to
+long lastSendTime = 0;        // Last send time
+int interval = 2000;          // Interval between sends
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial);
+  
+  Serial.println("LoRa Ground Station - Duplex");
+
+  // Set SPI0 pins
+  SPI.setRX(16);
+  SPI.setTX(19);
+  SPI.setSCK(18);
+
+  // Configure LoRa
+  LoRa.setSPI(SPI);
+  LoRa.enableCrc();
+  LoRa.setPins(csPin, resetPin, irqPin);
+
+  if (!LoRa.begin(915E6)) {
+    Serial.println("LoRa init failed. Check your connections.");
+    while (true); // Replace with reset attempt in production
+  }
+
+  Serial.println("LoRa init succeeded.");
+  Serial.println("Waiting for flight computer data...");
+}
+
+void loop() {
+  onReceive(LoRa.parsePacket());
+
+  // Optional: Send a message periodically (uncomment if needed)
+  /*
+  if (millis() - lastSendTime > interval) {
+    String message = "Ground ACK " + String(msgCount++);
+    sendMessage(message);
+    Serial.println("Sent: " + message);
+    lastSendTime = millis();
+  }
+  */
+}
+
+void sendMessage(String outgoing) {
+  LoRa.beginPacket();
+  // Optional: Add addressing (uncomment if flight computer supports it)
+  // LoRa.write(destination);        // Destination address
+  // LoRa.write(localAddress);       // Sender address
+  LoRa.write(outgoing.length());    // Payload length
+  LoRa.print(outgoing);             // Payload
+  if (!LoRa.endPacket()) {
+    Serial.println("Error: Failed to send packet");
+  }
+}
+
+void onReceive(int packetSize) {
+  if (packetSize == 0) return;
+
+  byte incomingLength = LoRa.read();
+  String incoming = "";
+
+  while (LoRa.available()) {
+    incoming += (char)LoRa.read();
+  }
+
+  if (incomingLength != incoming.length()) {
+    Serial.println("Error: Message length mismatch (Expected: " + String(incomingLength) + 
+                   ", Received: " + String(incoming.length()) + ")");
+    return;
+  }
+
+  // Parse flight computer packet (e.g., "[YYYY/MM/DD HH:MM:SS] IMU,BME,GPS")
+  int timestampEnd = incoming.indexOf(']');
+  if (timestampEnd != -1) {
+    String timestamp = incoming.substring(0, timestampEnd + 1);
+    String data = incoming.substring(timestampEnd + 2); // Skip "] "
+    
+    // Split data into IMU, BME, and GPS segments
+    int firstComma = data.indexOf(',');
+    int secondComma = data.indexOf(',', firstComma + 1);
+    int thirdComma = data.indexOf(',', secondComma + 1);
+    
+    String imuData = data.substring(0, thirdComma); // Up to third comma (accel + gyro + temp)
+    String bmeData = data.substring(thirdComma + 1, data.indexOf(',', thirdComma + 1) > 0 ? data.indexOf(',', thirdComma + 1) : data.length());
+    String gpsData = data.substring(data.lastIndexOf(',') + 1);
+
+    // Display parsed data
+    Serial.println("Received Packet:");
+    Serial.println("Timestamp: " + timestamp);
+    Serial.println("IMU Data: " + imuData);
+    Serial.println("BME Data: " + bmeData);
+    Serial.println("GPS Data: " + gpsData);
+    Serial.println("RSSI: " + String(LoRa.packetRssi()));
+    Serial.println("SNR: " + String(LoRa.packetSnr()));
+    Serial.println();
+
+    // Optional: Log to Serial in CSV format for easy parsing
+    Serial.print(millis());
+    Serial.print(",");
+    Serial.print(timestamp);
+    Serial.print(",");
+    Serial.print(imuData);
+    Serial.print(",");
+    Serial.print(bmeData);
+    Serial.print(",");
+    Serial.print(gpsData);
+    Serial.print(",");
+    Serial.print(LoRa.packetRssi());
+    Serial.print(",");
+    Serial.println(LoRa.packetSnr());
+  } else {
+    // Fallback for unparseable packets
+    Serial.println("Message length: " + String(incomingLength));
+    Serial.println("Message: " + incoming);
+    Serial.println("RSSI: " + String(LoRa.packetRssi()));
+    Serial.println("SNR: " + String(LoRa.packetSnr()));
+    Serial.println();
+  }
+}
